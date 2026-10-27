@@ -288,7 +288,7 @@ export function looksLikeImageBuffer(buf) {
 }
 
 /** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
-export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
+export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024) {
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
   let { url, ip } = await validateFetchUrl(urlString);

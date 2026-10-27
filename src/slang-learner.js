@@ -33,46 +33,127 @@ export function createId() {
   return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 }
 
+/**
+ * 黑话库的容量上限。
+ *
+ * 为什么必须有：`slang.json` 是唯一一个没有任何上限的存储 —— 三个写入点
+ * （AI 工具、控制台、学习器）都只 push 不裁剪，字段长度也没上限
+ * （单词最多 20 条证据 × 约 700 字节 ≈ 14KB，而且证据是按 JSON.stringify 去重的，
+ * 带时间戳的"重复"证据照样各占一份）。它只会涨。这里给一个明确上限：
+ * 超过就按「已确认 → 出现次数 → 最近更新」保留，剩下的按同样优先级丢弃。
+ */
+export const SLANG_MAX_ENTRIES = 2000;
+const SLANG_FIELD_MAX = 300;
+const SLANG_CONTENT_MAX = 50;
+const EVIDENCE_TEXT_MAX = 80;
+
 export function normalizeSlangEntry(raw) {
   const entry = raw && typeof raw === 'object' ? raw : {};
   const status = [SLANG_STATUS.CANDIDATE, SLANG_STATUS.CONFIRMED, SLANG_STATUS.REJECTED].includes(entry.status)
     ? entry.status
     : SLANG_STATUS.CANDIDATE;
+  const clip = (value, max) => {
+    const s = String(value ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '').trim();
+    return s.length > max ? s.slice(0, max) : s;
+  };
   return {
     id: String(entry.id || createId()),
-    content: String(entry.content ?? '').trim(),
-    meaning: String(entry.meaning ?? '').trim(),
-    usage: String(entry.usage ?? '').trim(),
-    example: String(entry.example ?? '').trim(),
-    risk: String(entry.risk ?? '').trim(),
-    sources: Array.isArray(entry.sources) ? entry.sources.map((s) => String(s ?? '').trim()).filter(Boolean).slice(-10) : [],
+    content: clip(entry.content, SLANG_CONTENT_MAX),
+    meaning: clip(entry.meaning, SLANG_FIELD_MAX),
+    usage: clip(entry.usage, SLANG_FIELD_MAX),
+    example: clip(entry.example, SLANG_FIELD_MAX),
+    risk: clip(entry.risk, SLANG_FIELD_MAX),
+    sources: Array.isArray(entry.sources) ? entry.sources.map((s) => clip(s, SLANG_FIELD_MAX)).filter(Boolean).slice(-10) : [],
     status,
     source: entry.source === 'manual' ? 'manual' : 'ai',
+    // 【衍生版补丁】黑话分类（2026-10-12）：空 = 未分类（「全部」语义，所有群可见）。
+    // ⚠️ 这里是字段白名单，漏掉这个字段会让分类在保存时被静默剥掉（已踩过一次）。
+    category: clip(entry.category, 20),
     count: Math.max(0, Number(entry.count) || 0),
-    evidence: Array.isArray(entry.evidence) ? entry.evidence.slice(-20) : [],
+    // 证据同样要限长：它是从群聊消息里截来的原文，是文件膨胀的主要来源。
+    evidence: Array.isArray(entry.evidence)
+      ? entry.evidence.slice(-20).map((ev) => (ev && typeof ev === 'object'
+        ? { ...ev, text: clip(ev.text, EVIDENCE_TEXT_MAX) }
+        : ev))
+      : [],
     lastInferenceCount: Math.max(0, Number(entry.lastInferenceCount) || 0),
     createdAt: String(entry.createdAt || nowIso()),
     updatedAt: String(entry.updatedAt || nowIso()),
   };
 }
 
-export function loadSlang(file) {
-  try {
-    let text = fs.readFileSync(file, 'utf8');
-    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-    const parsed = JSON.parse(text);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map(normalizeSlangEntry).filter((e) => e.content);
-  } catch {
-    return [];
-  }
+/**
+ * 按上限裁剪黑话库：优先保留已确认的、出现次数多的、最近更新的。
+ * @returns 被丢弃的条数
+ */
+export function capSlangEntries(entries, max = SLANG_MAX_ENTRIES) {
+  const list = Array.isArray(entries) ? entries : [];
+  const limit = Math.max(1, Number(max) || SLANG_MAX_ENTRIES);
+  if (list.length <= limit) return { entries: list, dropped: 0 };
+  const rank = (e) => (e?.status === SLANG_STATUS.CONFIRMED ? 2 : (e?.status === SLANG_STATUS.CANDIDATE ? 1 : 0));
+  const kept = [...list]
+    .sort((a, b) => rank(b) - rank(a)
+      || (Number(b?.count) || 0) - (Number(a?.count) || 0)
+      || String(b?.updatedAt ?? '').localeCompare(String(a?.updatedAt ?? '')))
+    .slice(0, limit);
+  return { entries: kept, dropped: list.length - kept.length };
 }
 
-export function saveSlang(file, entries) {
+/**
+ * 读取黑话库。
+ *
+ * 关键区别：**文件不存在**（ENOENT，首次运行）和**读失败**（EPERM/EBUSY/JSON 损坏）
+ * 必须分开处理。旧实现一律 `catch { return [] }`，于是一次杀软占用或一次半截写入
+ * 就会让整库看起来是空的 —— 而调用方察觉不到，紧接着的保存就把空数组写回去，
+ * 学到的词条（花 LLM 钱研究出来的、不可复现）永久消失。
+ * 现在：解析失败时把原始文件另存为 `.corrupt-<时间戳>` 并抛错，让上层决定是否继续。
+ */
+export function loadSlang(file, { onCorrupt } = {}) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    // 文件存在但读不出来：绝不能当成「空库」，否则下一次保存会覆盖掉它。
+    throw new Error(`黑话库读取失败（${error?.code || 'unknown'}）：${error?.message ?? error}`);
+  }
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  if (!text.trim()) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    const quarantine = `${file}.corrupt-${Date.now()}`;
+    try { fs.writeFileSync(quarantine, text, { encoding: 'utf8', mode: 0o600 }); } catch {}
+    const message = `黑话库 JSON 解析失败，原文已另存为 ${quarantine}：${error?.message ?? error}`;
+    onCorrupt?.(message);
+    throw new Error(message);
+  }
+  if (!Array.isArray(parsed)) {
+    const quarantine = `${file}.corrupt-${Date.now()}`;
+    try { fs.writeFileSync(quarantine, text, { encoding: 'utf8', mode: 0o600 }); } catch {}
+    const message = `黑话库顶层不是数组，原文已另存为 ${quarantine}`;
+    onCorrupt?.(message);
+    throw new Error(message);
+  }
+  return parsed.map(normalizeSlangEntry).filter((e) => e.content);
+}
+
+export function saveSlang(file, entries, { max = SLANG_MAX_ENTRIES } = {}) {
+  const { entries: capped, dropped } = capSlangEntries(
+    (Array.isArray(entries) ? entries : []).map(normalizeSlangEntry).filter((e) => e?.content),
+    max
+  );
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(entries, null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(capped, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw error;
+  }
+  return { entries: capped, dropped };
 }
 
 export function createSlangEntry({ content, meaning = '', usage = '', example = '', risk = '', sources = [], status = SLANG_STATUS.CANDIDATE, source = 'ai', evidence = [] } = {}) {
@@ -131,13 +212,57 @@ export function mergeEvidence(current, incoming) {
   return merged.slice(-20);
 }
 
-export function buildSlangContext(entries, max = 8) {
-  // 上限从 30 提到 200：owner 确认的黑话早已超过 30 条（2026-10 实测 104 条），
-  // 原来只注入前 8 条 → 群里问其余词条 AI 回答"不知道"。现在按 injectMax（配置，可到 200）注入。
-  const confirmed = (entries || [])
+/** 分类名「全部」：表示不限制（全注入）。空/未设置一律按「全部」处理。 */
+export const SLANG_CATEGORY_ALL = '全部';
+
+/**
+ * 【衍生版补丁】黑话分类（2026-10-12 owner 要求）。
+ *
+ * 背景：黑话库是**全局单文件**，而库内容会被某个领域的群（如铁路群）带偏——
+ * 实测暗区群因为注入了满屏铁路黑话，机器人开始在暗区群聊"淮蚌/存车场/站房"。
+ * 记忆隔离管不到黑话，所以给黑话加分类，各群可自选加载哪些分类。
+ *
+ * ⚠️ 语义（owner 两次纠正过，务必按这个理解）：
+ * 1. 「全部」**不是**并列分类，而是**总集/必选项**：每条黑话永远都在「全部」里，
+ *    归类只是让它**额外**出现在某个分类下，不会把它从「全部」剔除。
+ * 2. 三种入参对应三种行为（**区别很关键**）：
+ *    - `null` / `undefined` = 该群**从未设置**过分类 → **默认注入全部**（向后兼容）
+ *    - `[]`（空数组）        = 用户**明确一个都不选** → **一条都不注入**
+ *    - 含「全部」            = 注入全部
+ *    - 具体分类              = 只注入这些分类（未分类词条不注入，它们只属于「全部」）
+ */
+export function filterSlangByCategories(entries, selected) {
+  const list = Array.isArray(entries) ? entries : [];
+  // 从未设置 = 默认不限制（注入全部）
+  if (selected === null || selected === undefined) return list;
+  const sel = (Array.isArray(selected) ? selected : [])
+    .map((s) => String(s ?? '').trim())
+    .filter(Boolean);
+  // 选了「全部」= 不限制
+  if (sel.includes(SLANG_CATEGORY_ALL)) return list;
+  // 明确一个都没选 = 一条都不注入
+  if (!sel.length) return [];
+  const set = new Set(sel);
+  return list.filter((e) => {
+    const c = String(e?.category ?? '').trim();
+    // 未分类（空）或「全部」= 只属于总集，不在任何具体分类里 → 限定群不注入
+    if (!c || c === SLANG_CATEGORY_ALL) return false;
+    return set.has(c);
+  });
+}
+
+export function buildSlangContext(entries, max = 8, selectedCategories = null) {
+  // 【衍生版补丁】上限 30 → 200 → 500（2026-10-11 owner 要求「黑话全部列出，AI 太懒不去查」）。
+  // 历史：原只注入前 8 条 → 群里问其余词条 AI 答「不知道」。
+  // 0 / 负数 = 不限（全量注入）；否则 clamp(1, 500)。实测库 142 条 ≈ 13k 字符。
+  const rawMax = Number(max);
+  const limit = !Number.isFinite(rawMax) || rawMax <= 0 ? Number.MAX_SAFE_INTEGER : Math.min(500, Math.max(1, Math.round(rawMax)));
+  // 【衍生版补丁】按群所选分类过滤（selectedCategories=null 时不过滤，保持旧行为）
+  const scoped = selectedCategories == null ? (entries || []) : filterSlangByCategories(entries, selectedCategories);
+  const confirmed = scoped
     .filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning)
     .sort((a, b) => (b.count || 0) - (a.count || 0))
-    .slice(0, Math.max(1, Math.min(200, Number(max) || 8)));
+    .slice(0, limit);
   if (!confirmed.length) return '';
   const lines = confirmed.map((e) => {
     const clean = (s) => escapeLearnerText(String(s ?? '').replace(/\[CQ:/gi, '[CQ：'));
@@ -146,12 +271,30 @@ export function buildSlangContext(entries, max = 8) {
     if (e.example) line += `（例：${clean(e.example)}）`;
     return line;
   });
-  const total = (entries || []).filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning).length;
-  // 表外的词条：引导 AI 用 qq_slang_query 按需查，避免"表里没有就答不上来"。
+  const total = scoped.filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning).length;
+  // 【衍生版补丁】表外的词条：引导 AI 用 qq_slang_query 按需查，避免「表里没有就答不上来」。
   const more = total > confirmed.length
     ? `\n（表外还有 ${total - confirmed.length} 条已确认黑话；遇到表外的梗/黑话不确定时，用 qq_slang_query 查询后再回答。）`
     : '';
   return `【群聊黑话表】群里已确认/常用的网络用语和梗（按出现次数排序，知道即可，不要刻意堆砌）：\n${lines.join('\n')}${more}`;
+}
+
+/**
+ * 【衍生版补丁】研究重试提示：模型已经做完分析但没给 JSON 时，让它直接把结论整理成 JSON
+ * （不再搜索/分析）。2026-10-09 实况：web_search 对复合词常返回空，模型反复换关键词搜索，
+ * 输出 3.6 万字符思考过程后被 turn 截断，parseResearchJson 得到 0 条 → 控制台毫无变化。
+ */
+export function buildResearchRetryPrompt(candidates) {
+  const list = (candidates || [])
+    .map((e) => escapeLearnerText(String(e.content || '').slice(0, 50)))
+    .join('、');
+  return `停止搜索和分析。把你刚才对这几个词（${list}）的判断**直接整理成 JSON 数组**输出，不要输出任何其他文字。
+
+格式（每个候选一条）：
+[{"content":"词条","meaning":"含义或推测（不确定就写“未查到网络用法”）","usage":"","example":"","risk":"","sources":[],"confirmed":false}]
+
+- 有把握的 confirmed 设为 true；没把握/没搜到的设为 false（meaning 仍要写你的推测）。
+- **只输出 JSON 数组。**`;
 }
 
 export function buildExtractionPrompt(messages) {
@@ -191,14 +334,10 @@ export function buildResearchPrompt(candidates) {
 候选：
 ${list}
 
-**重要（2026-10-09 补充，之前多次失败就是因为没遵守）**：
-- 搜索**最多 6 步**；web_search 经常对复合词返回空，遇到空结果就换 1~2 个更简单的关键词，**不要无限重试搜索**。
-- 无论搜索是否成功，**最后都必须输出 JSON 数组**——搜索不到就基于群友语境给出你的判断，把 confirmed 设为 false；绝不能只输出思考过程/分析文字而不给 JSON。
-
 请输出 JSON 数组，每个元素：
 {
   "content": "词条",
-  "meaning": "含义（简洁，适合群友理解；不确定就写你的推测或“未查到网络用法”）",
+  "meaning": "含义（简洁，适合群友理解，必须基于真实网络用法）",
   "usage": "使用场景/语气（可选，说明在什么语境下用）",
   "example": "一个自然短句示例（可选）",
   "risk": "是否有敏感/慎用风险（可选，没有就留空）",
@@ -209,35 +348,77 @@ ${list}
 注意：
 - 不确定是否为网络用语的普通词，confirmed 设为 false。
 - 不要编造离谱含义；搜不到就写“不确定”并把 confirmed 设为 false。
-- **最后只输出 JSON 数组本身，不要输出任何分析/思考过程。**`;
+- 只输出 JSON 数组。`;
 }
 
-// 研究重试提示：模型已经做完分析但没给 JSON 时，让它直接把结论整理成 JSON（不再搜索/分析）。
-export function buildResearchRetryPrompt(candidates) {
-  const list = (candidates || [])
-    .map((e) => escapeLearnerText(String(e.content || '').slice(0, 50)))
-    .join('、');
-  return `停止搜索和分析。把你刚才对这几个词（${list}）的判断**直接整理成 JSON 数组**输出，不要输出任何其他文字。
-
-格式（每个候选一条）：
-[{"content":"词条","meaning":"含义或推测（不确定就写“未查到网络用法”）","usage":"","example":"","risk":"","sources":[],"confirmed":false}]
-
-- 有把握的 confirmed 设为 true；没把握/没搜到的设为 false（meaning 仍要写你的推测）。
-- **只输出 JSON 数组。**`;
+/**
+ * 从模型输出里抠出一个 JSON 数组。
+ *
+ * 为什么不能只用 `raw.match(/\[[\s\S]*\]/)`：那是**贪婪**匹配，取的是"第一个 `[` 到最后一个 `]`"。
+ * 模型很自然会先写一句解释再给 JSON，例如 `根据 [1] 的分析：\n[{"content":"yyds"}]` ——
+ * 此时匹配到的片段跨越了两个方括号结构，JSON.parse 必然失败，函数就**静默**返回 []：
+ * 学到的新词条/调研结果直接丢掉，日志里一个字都没有，只能靠人去猜"为什么今天没学到东西"。
+ *
+ * 这里改为：先整体 parse；失败则从左到右扫描出**括号配平**的 `[...]` 候选（扫描时跳过字符串字面量
+ * 里的括号与转义，否则词条内容里出现 `[` 就会算错深度），逐个尝试 parse。
+ *
+ * 候选的取舍：优先返回「至少含一个对象元素」的那个数组。只看"能否 parse 成数组"是不够的 ——
+ * `根据 [1] 的分析：[{...}]` 里 `[1]` 本身就是一个合法 JSON 数组，先到先得会把真正的结果挤掉，
+ * 调用方拿到的仍是 []（这正是本条 finding 要修的场景）。若所有候选都不含对象，则退回第一个可解析的
+ * 数组，保持与原实现一致的"确实是数组就返回"语义。候选数量与总长度都设上限，避免超长文本变成 O(n²)。
+ */
+export function extractJsonArray(text) {
+  const raw = String(text ?? '').trim();
+  if (!raw) return null;
+  try {
+    const direct = JSON.parse(raw);
+    if (Array.isArray(direct)) return direct;
+  } catch {}
+  if (raw.length > 400_000) return null; // 超长文本不做候选扫描，避免 O(n²) 卡住事件循环
+  const MAX_CANDIDATES = 32;
+  const candidates = [];
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw[i] !== '[') continue;
+    if (candidates.length >= MAX_CANDIDATES) break;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let j = i; j < raw.length; j += 1) {
+      const c = raw[j];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (c === '\\') escaped = true;
+        else if (c === '"') inString = false;
+        continue;
+      }
+      if (c === '"') { inString = true; continue; }
+      if (c === '[') depth += 1;
+      else if (c === ']') {
+        depth -= 1;
+        if (depth === 0) {
+          candidates.push(raw.slice(i, j + 1));
+          break; // 这一个括号段扫描完；它内部的 '[' 仍可能是更小的合法数组，交给外层继续
+        }
+      }
+    }
+  }
+  let fallback = null;
+  for (const candidate of candidates) {
+    let parsed;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(parsed)) continue;
+    if (parsed.some((item) => item && typeof item === 'object' && !Array.isArray(item))) return parsed;
+    if (fallback === null) fallback = parsed;
+  }
+  return fallback;
 }
 
 export function parseExtractionJson(text) {
-  const raw = String(text ?? '').trim();
-  if (!raw) return [];
-  let data = null;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    const match = raw.match(/\[[\s\S]*\]/);
-    if (match) {
-      try { data = JSON.parse(match[0]); } catch { data = null; }
-    }
-  }
+  const data = extractJsonArray(text);
   if (!Array.isArray(data)) return [];
   return data
     .filter((item) => item && typeof item === 'object' && String(item.content ?? '').trim())
@@ -248,17 +429,7 @@ export function parseExtractionJson(text) {
 }
 
 export function parseResearchJson(text) {
-  const raw = String(text ?? '').trim();
-  if (!raw) return [];
-  let data = null;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    const match = raw.match(/\[[\s\S]*\]/);
-    if (match) {
-      try { data = JSON.parse(match[0]); } catch { data = null; }
-    }
-  }
+  const data = extractJsonArray(text);
   if (!Array.isArray(data)) return [];
   return data
     .filter((item) => item && typeof item === 'object' && String(item.content ?? '').trim())
